@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- Green cucumber/gherkin file icon -->
+  <rect x="1" y="1" width="11" height="14" rx="1.5" fill="#1a472a"/>
+  <path d="M8 1 L12 5 L8 5 Z" fill="#2d7a3a"/>
+  <rect x="8" y="1" width="4" height="4" rx="0.5" fill="#2d7a3a"/>
+  <!-- Three lines representing feature steps -->
+  <rect x="3" y="7" width="7" height="1.2" rx="0.5" fill="#4CAF50"/>
+  <rect x="3" y="9.2" width="5.5" height="1.2" rx="0.5" fill="#4CAF50"/>
+  <rect x="3" y="11.4" width="6.5" height="1.2" rx="0.5" fill="#4CAF50"/>
+</svg>

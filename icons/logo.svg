@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
+  <!-- Outer white border -->
+  <circle cx="64" cy="64" r="62" fill="white" stroke="none"/>
+
+  <!-- Main lime green circle -->
+  <circle cx="64" cy="64" r="58" fill="#9ACD32" stroke="none"/>
+
+  <!-- White "r" letter -->
+  <text x="64" y="88" font-family="Arial, sans-serif" font-size="80" font-weight="bold"
+        text-anchor="middle" fill="white" dominant-baseline="middle">r</text>
+</svg>

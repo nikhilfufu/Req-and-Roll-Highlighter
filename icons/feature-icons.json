@@ -1,0 +1,14 @@
+{
+  "iconDefinitions": {
+    "_feature": {
+      "iconPath": "./feature-file.svg"
+    }
+  },
+  "fileExtensions": {
+    "feature": "_feature"
+  },
+  "languageIds": {
+    "feature": "_feature",
+    "gherkin": "_feature"
+  }
+}
