@@ -1,33 +1,37 @@
 const vscode = require('vscode');
 const fs = require('fs');
 
-let paramDecoration, outlineDecoration, stepKwDecoration, featureKwDecoration, unmatchedDecoration;
+let paramDecoration, outlineDecoration, stepKwDecoration, featureKwDecoration,
+    unmatchedDecoration, ambiguousDecoration;
 let stepDefinitions = [];
-let stepDefsLoaded = false;  // suppress red lines until first load completes
-let statusBarItem;          // shows loading spinner / step count
+let stepDefsLoaded = false;
+let statusBarItem;
 
 // Prefix index: first 3 literal words of pattern -> [defs]
 let stepIndex = new Map();
 
-// Version cache: docUri -> { version, paramRanges, outlineRanges, stepKwRanges, featureKwRanges }
+// Version cache: docUri -> { version, ...ranges }
 const decorCache = new Map();
 
 // Debounce timers: docUri -> timeoutId
 const debounceTimers = new Map();
 const DEBOUNCE_MS = 250;
 
-// Unmatched step tracker for code actions: docUri -> [{range, keyword, stepText}]
+// Unmatched step tracker:   docUri -> [{range, keyword, stepText}]
 const unmatchedStepMap = new Map();
+
+// Ambiguous step tracker:   docUri -> [{range, keyword, stepText, matchingDefs[]}]
+const ambiguousStepMap = new Map();
 
 // ─── Pattern helpers ──────────────────────────────────────────────────────────
 
 function patternToRegex(pattern) {
     pattern = pattern
-        .replace(/\{int\}/g,            '(-?\\d+)')
-        .replace(/\{float\}|\{double\}/g,'(-?\\d*\\.?\\d+)')
-        .replace(/\{word\}/g,           '(\\w+)')
-        .replace(/\{string\}/g,         '("[^"]*"|\'[^\']*\')')
-        .replace(/\{\}/g,               '(.*)');
+        .replace(/\{int\}/g,             '(-?\\d+)')
+        .replace(/\{float\}|\{double\}/g, '(-?\\d*\\.?\\d+)')
+        .replace(/\{word\}/g,            '(\\w+)')
+        .replace(/\{string\}/g,          '("[^"]*"|\'[^\']*\')')
+        .replace(/\{\}/g,                '(.*)');
     const LPAR = '\u0001', RPAR = '\u0002';
     pattern = pattern.replace(/\\\(/g, LPAR).replace(/\\\)/g, RPAR);
     const parts = pattern.split(/(\([^)]*\))/);
@@ -96,7 +100,7 @@ async function loadStepDefinitions() {
                     const rawPattern = isVerbatim ? m[2] : m[2].replace(/\\(.)/g, '$1');
                     const lineNum = content.slice(0, m.index).split('\n').length - 1;
                     const prefix = literalPrefix(rawPattern);
-                    stepDefinitions.push({ regex: patternToRegex(rawPattern), prefix, file, line: lineNum });
+                    stepDefinitions.push({ regex: patternToRegex(rawPattern), rawPattern, prefix, file, line: lineNum });
                 } catch (_) {}
             }
         } catch (_) {}
@@ -104,6 +108,7 @@ async function loadStepDefinitions() {
     buildIndex();
     decorCache.clear();
     unmatchedStepMap.clear();
+    ambiguousStepMap.clear();
     stepDefsLoaded = true;
     if (statusBarItem) {
         statusBarItem.text = `$(check) BDD: ${stepDefinitions.length} steps`;
@@ -116,8 +121,9 @@ async function loadStepDefinitions() {
 
 function computeDecorations(doc) {
     const paramRanges = [], outlineRanges = [], stepKwRanges = [],
-          featureKwRanges = [], unmatchedRanges = [];
-    const unmatchedSteps = [];   // [{range, keyword, stepText}]
+          featureKwRanges = [], unmatchedRanges = [], ambiguousRanges = [];
+    const unmatchedSteps = [];  // [{range, keyword, stepText}]
+    const ambiguousSteps = [];  // [{range, keyword, stepText, matchingDefs[]}]
 
     const stepKwRe    = /^(\s*)(Given|When|Then|And|But)(\s+)/i;
     const featureKwRe = /^(\s*)(Feature:|Scenario Outline:|Scenario:|Background:|Examples:|Rule:)/i;
@@ -125,27 +131,68 @@ function computeDecorations(doc) {
 
     for (let ln = 0; ln < doc.lineCount; ln++) {
         const lineText = doc.lineAt(ln).text;
+
         const fk = lineText.match(featureKwRe);
         if (fk) featureKwRanges.push(new vscode.Range(ln, fk[1].length, ln, fk[1].length + fk[2].length));
+
         const sk = lineText.match(stepKwRe);
         if (!sk) continue;
+
         const stepStart = sk[0].length;
         stepKwRanges.push(new vscode.Range(ln, sk[1].length, ln, sk[1].length + sk[2].length));
+
         const stepText = lineText.slice(stepStart).trim();
+
         outlineRe.lastIndex = 0;
         let om;
         while ((om = outlineRe.exec(lineText)) !== null) {
             outlineRanges.push(new vscode.Range(ln, om.index, ln, om.index + om[0].length));
         }
+
+        // ── Collect ALL definitions that match this step ──────────────────
         const candidates = getCandidates(stepText);
-        let bestMatch = null, bestCapLen = Infinity;
+        const allMatches = [];  // [{def, match, capLen}]
+
         for (const def of candidates) {
             const m = stepText.match(def.regex);
             if (!m) continue;
             const capLen = m.slice(1).reduce((sum, g) => sum + (g ? g.length : 0), 0);
-            if (capLen < bestCapLen) { bestCapLen = capLen; bestMatch = m; }
+            allMatches.push({ def, match: m, capLen });
         }
-        if (bestMatch) {
+
+        const endCol = lineText.trimEnd().length;
+        const range  = new vscode.Range(ln, stepStart, ln, endCol);
+
+        if (allMatches.length === 0) {
+            // ── No definition found → purple unmatched ────────────────────
+            if (stepDefsLoaded) {
+                unmatchedRanges.push(range);
+                unmatchedSteps.push({ range, keyword: sk[2], stepText });
+            }
+        } else if (allMatches.length > 1) {
+            // ── More than one definition matches → orange ambiguous ────────
+            // Reqnroll throws AmbiguousStepDefinitionException at runtime
+            ambiguousRanges.push(range);
+            ambiguousSteps.push({
+                range,
+                keyword: sk[2],
+                stepText,
+                matchingDefs: allMatches.map(({ def }) => def),
+            });
+            // Still highlight params using best (lowest capLen) match so the
+            // file doesn't look broken while the developer resolves the conflict
+            const best = allMatches.reduce((a, b) => a.capLen <= b.capLen ? a : b);
+            let searchFrom = stepStart;
+            for (let g = 1; g < best.match.length; g++) {
+                if (!best.match[g]) continue;
+                const val = best.match[g];
+                const idx = lineText.indexOf(val, searchFrom);
+                if (/^<[^>]+>$/.test(val)) { searchFrom = idx + val.length; continue; }
+                if (idx >= 0) { paramRanges.push(new vscode.Range(ln, idx, ln, idx + val.length)); searchFrom = idx + val.length; }
+            }
+        } else {
+            // ── Exactly one match → all good, highlight params ────────────
+            const { match: bestMatch } = allMatches[0];
             let searchFrom = stepStart;
             for (let g = 1; g < bestMatch.length; g++) {
                 if (!bestMatch[g]) continue;
@@ -154,14 +201,13 @@ function computeDecorations(doc) {
                 if (/^<[^>]+>$/.test(val)) { searchFrom = idx + val.length; continue; }
                 if (idx >= 0) { paramRanges.push(new vscode.Range(ln, idx, ln, idx + val.length)); searchFrom = idx + val.length; }
             }
-        } else if (stepDefsLoaded) {
-            const endCol = lineText.trimEnd().length;
-            const range = new vscode.Range(ln, stepStart, ln, endCol);
-            unmatchedRanges.push(range);
-            unmatchedSteps.push({ range, keyword: sk[2], stepText });
         }
     }
-    return { paramRanges, outlineRanges, stepKwRanges, featureKwRanges, unmatchedRanges, unmatchedSteps };
+    return {
+        paramRanges, outlineRanges, stepKwRanges, featureKwRanges,
+        unmatchedRanges, unmatchedSteps,
+        ambiguousRanges, ambiguousSteps,
+    };
 }
 
 function decorateEditor(editor) {
@@ -175,16 +221,19 @@ function decorateEditor(editor) {
         editor.setDecorations(stepKwDecoration,    cached.stepKwRanges);
         editor.setDecorations(featureKwDecoration, cached.featureKwRanges);
         editor.setDecorations(unmatchedDecoration, cached.unmatchedRanges);
+        editor.setDecorations(ambiguousDecoration, cached.ambiguousRanges);
         return;
     }
     const result = computeDecorations(doc);
     decorCache.set(key, { version: doc.version, ...result });
     unmatchedStepMap.set(key, result.unmatchedSteps);
+    ambiguousStepMap.set(key, result.ambiguousSteps);
     editor.setDecorations(paramDecoration,     result.paramRanges);
     editor.setDecorations(outlineDecoration,   result.outlineRanges);
     editor.setDecorations(stepKwDecoration,    result.stepKwRanges);
     editor.setDecorations(featureKwDecoration, result.featureKwRanges);
     editor.setDecorations(unmatchedDecoration, result.unmatchedRanges);
+    editor.setDecorations(ambiguousDecoration, result.ambiguousRanges);
 }
 
 function scheduleDecorate(editor) {
@@ -197,61 +246,32 @@ function scheduleDecorate(editor) {
 
 // ─── Snippet generator ────────────────────────────────────────────────────────
 
-/**
- * Converts a plain-English step text into a C# Reqnroll step definition snippet.
- *
- * Detection order (first match wins per token):
- *   "quoted string"   → {string}  → string paramN
- *   decimal number    → {double}  → double paramN
- *   integer           → {int}     → int    paramN
- *
- * The keyword (Given/When/Then/And/But) is normalised to Given/When/Then for
- * the C# attribute (And/But are ambiguous, so we default to Given).
- */
 function generateStepSnippet(keyword, stepText) {
     const kwMap = { given: 'Given', when: 'When', then: 'Then', and: 'Given', but: 'Given' };
-    const attr = kwMap[keyword.toLowerCase()] || 'Given';
-
+    const attr  = kwMap[keyword.toLowerCase()] || 'Given';
     const params = [];
     let idx = 0;
 
-    // Replace in a single pass to keep parameter order stable
     const pattern = stepText
-        .replace(/"[^"]*"/g, () => {
-            params.push({ type: 'string', name: `p${++idx}` });
-            return '{string}';
-        })
-        .replace(/\b-?\d+\.\d+\b/g, () => {
-            params.push({ type: 'double', name: `p${++idx}` });
-            return '{double}';
-        })
-        .replace(/\b-?\d+\b/g, () => {
-            params.push({ type: 'int', name: `p${++idx}` });
-            return '{int}';
-        });
+        .replace(/"[^"]*"/g,      () => { params.push({ type: 'string', name: `p${++idx}` }); return '{string}'; })
+        .replace(/\b-?\d+\.\d+\b/g, () => { params.push({ type: 'double', name: `p${++idx}` }); return '{double}'; })
+        .replace(/\b-?\d+\b/g,   () => { params.push({ type: 'int',    name: `p${++idx}` }); return '{int}'; });
 
-    // Build a PascalCase method name from the first 6 non-param words
     const methodName = pattern
-        .replace(/\{[^}]+\}/g, '')          // strip param placeholders
-        .replace(/[^a-zA-Z0-9 ]/g, ' ')     // strip punctuation
-        .trim()
-        .split(/\s+/)
-        .filter(Boolean)
-        .slice(0, 6)
+        .replace(/\{[^}]+\}/g, '').replace(/[^a-zA-Z0-9 ]/g, ' ').trim()
+        .split(/\s+/).filter(Boolean).slice(0, 6)
         .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
         .join('') || 'StepDefinition';
 
     const csParams = params.map(p => `${p.type} ${p.name}`).join(', ');
-
-    const lines = [
+    return [
         `[${attr}(@"${pattern}")]`,
         `public void ${methodName}(${csParams})`,
         `{`,
         `    // TODO: implement step`,
         `    throw new PendingStepException();`,
         `}`,
-    ];
-    return lines.join('\n');
+    ].join('\n');
 }
 
 // ─── Code action provider ─────────────────────────────────────────────────────
@@ -263,17 +283,33 @@ const snippetCodeActionProvider = {
         if (!document.fileName.endsWith('.feature')) return [];
         if (!stepDefsLoaded) return [];
 
-        const key = document.uri.toString();
-        const unmatched = unmatchedStepMap.get(key) || [];
+        const key     = document.uri.toString();
         const actions = [];
 
-        for (const entry of unmatched) {
-            // Fire when the cursor / selection overlaps an unmatched step range
+        // ── Ambiguous steps: show conflict navigator ───────────────────────
+        for (const entry of (ambiguousStepMap.get(key) || [])) {
+            if (!entry.range.intersection(range)) continue;
+
+            const showAction = new vscode.CodeAction(
+                `$(warning) Ambiguous — ${entry.matchingDefs.length} definitions match this step`,
+                SNIPPET_ACTION_KIND
+            );
+            showAction.command = {
+                command: 'bdd.showAmbiguousMatches',
+                title: 'Show all matching step definitions',
+                arguments: [entry.matchingDefs, entry.stepText],
+            };
+            showAction.isPreferred = true;
+            actions.push(showAction);
+            break;
+        }
+
+        // ── Unmatched steps: offer snippet generation ──────────────────────
+        for (const entry of (unmatchedStepMap.get(key) || [])) {
             if (!entry.range.intersection(range)) continue;
 
             const snippet = generateStepSnippet(entry.keyword, entry.stepText);
 
-            // ── Action 1: Copy snippet to clipboard ──────────────────────────
             const copyAction = new vscode.CodeAction(
                 `$(clippy) Copy step definition snippet`,
                 SNIPPET_ACTION_KIND
@@ -281,13 +317,11 @@ const snippetCodeActionProvider = {
             copyAction.command = {
                 command: 'bdd.copyStepSnippet',
                 title: 'Copy step definition snippet',
-                arguments: [snippet, entry.keyword, entry.stepText],
+                arguments: [snippet],
             };
             copyAction.isPreferred = true;
-            copyAction.diagnostics = [];
             actions.push(copyAction);
 
-            // ── Action 2: Insert snippet into a step-definitions file ────────
             const insertAction = new vscode.CodeAction(
                 `$(new-file) Insert step definition into Steps file`,
                 SNIPPET_ACTION_KIND
@@ -295,78 +329,77 @@ const snippetCodeActionProvider = {
             insertAction.command = {
                 command: 'bdd.insertStepSnippet',
                 title: 'Insert step definition into Steps file',
-                arguments: [snippet, entry.keyword, entry.stepText],
+                arguments: [snippet],
             };
             actions.push(insertAction);
-
-            // Only generate one action set per cursor position
             break;
         }
+
         return actions;
     }
 };
 
-// ─── Command: copy snippet to clipboard ──────────────────────────────────────
+// ─── Command: navigate ambiguous matches ──────────────────────────────────────
 
-async function cmdCopyStepSnippet(snippet, keyword, stepText) {
-    await vscode.env.clipboard.writeText(snippet);
-    vscode.window.showInformationMessage(
-        `Step definition snippet copied to clipboard!`,
-        { detail: `Paste it into your C# Steps class.` }
-    );
-}
-
-// ─── Command: pick a .cs Steps file and insert the snippet ───────────────────
-
-async function cmdInsertStepSnippet(snippet, keyword, stepText) {
-    // Find candidate step definition files
-    const files = await vscode.workspace.findFiles('**/Steps/**/*.cs', '**/bin/**');
-
-    if (files.length === 0) {
-        vscode.window.showWarningMessage(
-            'No C# step definition files found under **/Steps/**/*.cs'
-        );
-        return;
-    }
-
-    // Build quick-pick items (relative paths for readability)
-    const items = files.map(f => ({
-        label: vscode.workspace.asRelativePath(f),
-        uri: f,
+async function cmdShowAmbiguousMatches(matchingDefs, stepText) {
+    const items = matchingDefs.map(def => ({
+        label:       `$(go-to-file) ${vscode.workspace.asRelativePath(def.file)}`,
+        description: `Line ${def.line + 1}`,
+        detail:      `Pattern: ${def.rawPattern}`,
+        def,
     }));
 
     const picked = await vscode.window.showQuickPick(items, {
-        placeHolder: 'Select a Steps .cs file to insert the snippet into',
-        matchOnDetail: true,
+        placeHolder: `⚠ Ambiguous: "${stepText}" matches ${matchingDefs.length} definitions — select one to navigate`,
+        matchOnDetail:      true,
+        matchOnDescription: true,
     });
     if (!picked) return;
 
-    const doc = await vscode.workspace.openTextDocument(picked.uri);
+    const doc    = await vscode.workspace.openTextDocument(picked.def.file);
     const editor = await vscode.window.showTextDocument(doc);
+    const pos    = new vscode.Position(picked.def.line, 0);
+    editor.selection = new vscode.Selection(pos, pos);
+    editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
+}
 
-    // Find the last closing brace of a class — insert just before it
-    const text = doc.getText();
+// ─── Command: copy snippet ────────────────────────────────────────────────────
+
+async function cmdCopyStepSnippet(snippet) {
+    await vscode.env.clipboard.writeText(snippet);
+    vscode.window.showInformationMessage('Step definition snippet copied to clipboard!');
+}
+
+// ─── Command: insert snippet into a Steps .cs file ───────────────────────────
+
+async function cmdInsertStepSnippet(snippet) {
+    const files = await vscode.workspace.findFiles('**/Steps/**/*.cs', '**/bin/**');
+    if (files.length === 0) {
+        vscode.window.showWarningMessage('No C# step definition files found under **/Steps/**/*.cs');
+        return;
+    }
+
+    const items  = files.map(f => ({ label: vscode.workspace.asRelativePath(f), uri: f }));
+    const picked = await vscode.window.showQuickPick(items, {
+        placeHolder: 'Select a Steps .cs file to insert the snippet into',
+    });
+    if (!picked) return;
+
+    const doc    = await vscode.workspace.openTextDocument(picked.uri);
+    const editor = await vscode.window.showTextDocument(doc);
+    const text   = doc.getText();
     const lastBrace = text.lastIndexOf('}');
     if (lastBrace < 0) {
         vscode.window.showErrorMessage('Could not find a suitable insertion point in the file.');
         return;
     }
 
-    // Determine indentation from file (2 or 4 spaces, or tab)
-    const indentMatch = text.match(/^(\s+)\[(?:Given|When|Then)/m);
-    const indent = indentMatch ? indentMatch[1] : '    ';
+    const indentMatch    = text.match(/^(\s+)\[(?:Given|When|Then)/m);
+    const indent         = indentMatch ? indentMatch[1] : '    ';
+    const indentedSnippet = '\n' + snippet.split('\n').map(l => (l.trim() === '' ? '' : indent + l)).join('\n') + '\n';
 
-    const indentedSnippet = '\n' + snippet
-        .split('\n')
-        .map(l => (l.trim() === '' ? '' : indent + l))
-        .join('\n') + '\n';
+    await editor.edit(eb => eb.insert(doc.positionAt(lastBrace), indentedSnippet));
 
-    await editor.edit(editBuilder => {
-        const insertPos = doc.positionAt(lastBrace);
-        editBuilder.insert(insertPos, indentedSnippet);
-    });
-
-    // Move cursor to the TODO line so the developer sees it immediately
     const newText = editor.document.getText();
     const todoIdx = newText.lastIndexOf('// TODO: implement step');
     if (todoIdx >= 0) {
@@ -374,7 +407,6 @@ async function cmdInsertStepSnippet(snippet, keyword, stepText) {
         editor.selection = new vscode.Selection(pos, pos);
         editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
     }
-
     vscode.window.showInformationMessage(`Step definition inserted into ${picked.label}`);
 }
 
@@ -385,7 +417,7 @@ const definitionProvider = {
         const lineText = document.lineAt(position.line).text;
         const kw = lineText.match(/^(\s*)(Given|When|Then|And|But)\s+/i);
         if (!kw) return null;
-        const stepText = lineText.slice(kw[0].length).trim();
+        const stepText   = lineText.slice(kw[0].length).trim();
         const candidates = getCandidates(stepText);
         let bestDef = null, bestCapLen = Infinity;
         for (const def of candidates) {
@@ -402,14 +434,22 @@ const definitionProvider = {
 
 function activate(context) {
     paramDecoration     = vscode.window.createTextEditorDecorationType({ color: '#CE9178', fontWeight: 'bold' });
-    outlineDecoration   = vscode.window.createTextEditorDecorationType({ color: '#FF69B4', fontWeight: 'bold' });
-    outlineDecoration = vscode.window.createTextEditorDecorationType({ color: '#4EC994', fontWeight: 'bold' });
+    outlineDecoration   = vscode.window.createTextEditorDecorationType({ color: '#4EC994', fontWeight: 'bold' });
     stepKwDecoration    = vscode.window.createTextEditorDecorationType({ color: '#569CD6', fontWeight: 'bold' });
     featureKwDecoration = vscode.window.createTextEditorDecorationType({ color: '#C586C0', fontWeight: 'bold' });
+
+    // Purple wavy underline = no matching definition
     unmatchedDecoration = vscode.window.createTextEditorDecorationType({
-    color: '#C586C0',
-    fontWeight: 'bold',
-    textDecoration: 'underline wavy #C586C0',
+        color: '#C586C0',
+        fontWeight: 'bold',
+        textDecoration: 'underline wavy #C586C0',
+    });
+
+    // Orange wavy underline = multiple definitions match (ambiguous)
+    ambiguousDecoration = vscode.window.createTextEditorDecorationType({
+        color: '#FF8C00',
+        fontWeight: 'bold',
+        textDecoration: 'underline wavy #FF8C00',
     });
 
     statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
@@ -433,23 +473,21 @@ function activate(context) {
     context.subscriptions.push(
         watcher,
         statusBarItem,
-        paramDecoration, outlineDecoration, stepKwDecoration, featureKwDecoration, unmatchedDecoration,
+        paramDecoration, outlineDecoration, stepKwDecoration,
+        featureKwDecoration, unmatchedDecoration, ambiguousDecoration,
 
-        // Go-to-definition
         vscode.languages.registerDefinitionProvider({ language: 'feature' }, definitionProvider),
         vscode.languages.registerDefinitionProvider({ language: 'gherkin' }, definitionProvider),
         vscode.languages.registerDefinitionProvider({ scheme: 'file', pattern: '**/*.feature' }, definitionProvider),
 
-        // Snippet quick-fix lightbulb
         vscode.languages.registerCodeActionsProvider(featureSelector, snippetCodeActionProvider, {
             providedCodeActionKinds: [SNIPPET_ACTION_KIND],
         }),
 
-        // Commands wired to the code actions
-        vscode.commands.registerCommand('bdd.copyStepSnippet',   cmdCopyStepSnippet),
-        vscode.commands.registerCommand('bdd.insertStepSnippet', cmdInsertStepSnippet),
+        vscode.commands.registerCommand('bdd.copyStepSnippet',      cmdCopyStepSnippet),
+        vscode.commands.registerCommand('bdd.insertStepSnippet',    cmdInsertStepSnippet),
+        vscode.commands.registerCommand('bdd.showAmbiguousMatches', cmdShowAmbiguousMatches),
 
-        // Editor events
         vscode.window.onDidChangeActiveTextEditor(decorateEditor),
         vscode.workspace.onDidChangeTextDocument(evt => {
             const ed = vscode.window.activeTextEditor;
