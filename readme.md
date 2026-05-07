@@ -136,7 +136,7 @@ Scenario Outline: Purchase validation
 
 ---
 
-## 🆕 New Updates (v0.0.4)
+## 🆕 New Updates (v0.0.5)
 
 ### ⚠️ Ambiguous Step Detection
 - Automatically detects when **multiple step definitions match the same step**
