@@ -88,7 +88,10 @@ async function loadStepDefinitions() {
     }
     stepDefinitions = [];
     const files = await vscode.workspace.findFiles('**/Steps/**/*.cs', '**/bin/**');
-    const attrRe = /\[\s*(?:Given|When|Then|And|But)\s*\(\s*(@?)"((?:[^"\\]|\\.)*)"\s*\)/g;
+
+    // Capture the keyword (group 1), verbatim flag (group 2), and pattern (group 3)
+    const attrRe = /\[\s*(Given|When|Then|And|But)\s*\(\s*(@?)"((?:[^"\\]|\\.)*)"\s*\)/g;
+
     for (const file of files) {
         try {
             const content = fs.readFileSync(file.fsPath, 'utf8');
@@ -96,11 +99,19 @@ async function loadStepDefinitions() {
             let m;
             while ((m = attrRe.exec(content)) !== null) {
                 try {
-                    const isVerbatim = m[1] === '@';
-                    const rawPattern = isVerbatim ? m[2] : m[2].replace(/\\(.)/g, '$1');
-                    const lineNum = content.slice(0, m.index).split('\n').length - 1;
-                    const prefix = literalPrefix(rawPattern);
-                    stepDefinitions.push({ regex: patternToRegex(rawPattern), rawPattern, prefix, file, line: lineNum });
+                    const defKeyword  = m[1].toLowerCase();          // given | when | then | and | but
+                    const isVerbatim  = m[2] === '@';
+                    const rawPattern  = isVerbatim ? m[3] : m[3].replace(/\\(.)/g, '$1');
+                    const lineNum     = content.slice(0, m.index).split('\n').length - 1;
+                    const prefix      = literalPrefix(rawPattern);
+                    stepDefinitions.push({
+                        regex: patternToRegex(rawPattern),
+                        rawPattern,
+                        prefix,
+                        defKeyword,   // ← stored on every definition
+                        file,
+                        line: lineNum,
+                    });
                 } catch (_) {}
             }
         } catch (_) {}
@@ -119,11 +130,22 @@ async function loadStepDefinitions() {
 
 // ─── Decoration computation ───────────────────────────────────────────────────
 
+// Which definition keywords are compatible with each feature-file keyword.
+// A "When" step in the feature should only match [When(...)], [And(...)], [But(...)] definitions.
+// "And" / "But" in the feature are context-neutral so they match everything.
+const KW_COMPAT = {
+    given: new Set(['given', 'and', 'but']),
+    when:  new Set(['when',  'and', 'but']),
+    then:  new Set(['then',  'and', 'but']),
+    and:   new Set(['given', 'when', 'then', 'and', 'but']),
+    but:   new Set(['given', 'when', 'then', 'and', 'but']),
+};
+
 function computeDecorations(doc) {
     const paramRanges = [], outlineRanges = [], stepKwRanges = [],
           featureKwRanges = [], unmatchedRanges = [], ambiguousRanges = [];
-    const unmatchedSteps = [];  // [{range, keyword, stepText}]
-    const ambiguousSteps = [];  // [{range, keyword, stepText, matchingDefs[]}]
+    const unmatchedSteps = [];
+    const ambiguousSteps = [];
 
     const stepKwRe    = /^(\s*)(Given|When|Then|And|But)(\s+)/i;
     const featureKwRe = /^(\s*)(Feature:|Scenario Outline:|Scenario:|Background:|Examples:|Rule:)/i;
@@ -142,6 +164,8 @@ function computeDecorations(doc) {
         stepKwRanges.push(new vscode.Range(ln, sk[1].length, ln, sk[1].length + sk[2].length));
 
         const stepText = lineText.slice(stepStart).trim();
+        const stepKw   = sk[2].toLowerCase();                          // keyword used in .feature
+        const compatSet = KW_COMPAT[stepKw] || new Set([stepKw]);     // compatible def keywords
 
         outlineRe.lastIndex = 0;
         let om;
@@ -149,11 +173,14 @@ function computeDecorations(doc) {
             outlineRanges.push(new vscode.Range(ln, om.index, ln, om.index + om[0].length));
         }
 
-        // ── Collect ALL definitions that match this step ──────────────────
+        // ── Collect definitions that both match the text AND have a compatible keyword ──
         const candidates = getCandidates(stepText);
-        const allMatches = [];  // [{def, match, capLen}]
+        const allMatches = [];
 
         for (const def of candidates) {
+            // ← KEY FIX: skip definitions whose keyword is incompatible with this step's keyword
+            if (!compatSet.has(def.defKeyword)) continue;
+
             const m = stepText.match(def.regex);
             if (!m) continue;
             const capLen = m.slice(1).reduce((sum, g) => sum + (g ? g.length : 0), 0);
@@ -164,14 +191,13 @@ function computeDecorations(doc) {
         const range  = new vscode.Range(ln, stepStart, ln, endCol);
 
         if (allMatches.length === 0) {
-            // ── No definition found → purple unmatched ────────────────────
+            // ── No compatible definition found → purple unmatched ─────────
             if (stepDefsLoaded) {
                 unmatchedRanges.push(range);
                 unmatchedSteps.push({ range, keyword: sk[2], stepText });
             }
         } else if (allMatches.length > 1) {
-            // ── More than one definition matches → orange ambiguous ────────
-            // Reqnroll throws AmbiguousStepDefinitionException at runtime
+            // ── More than one compatible definition matches → orange ambiguous ──
             ambiguousRanges.push(range);
             ambiguousSteps.push({
                 range,
@@ -179,8 +205,7 @@ function computeDecorations(doc) {
                 stepText,
                 matchingDefs: allMatches.map(({ def }) => def),
             });
-            // Still highlight params using best (lowest capLen) match so the
-            // file doesn't look broken while the developer resolves the conflict
+            // Still highlight params using best (lowest capLen) match
             const best = allMatches.reduce((a, b) => a.capLen <= b.capLen ? a : b);
             let searchFrom = stepStart;
             for (let g = 1; g < best.match.length; g++) {
@@ -191,7 +216,7 @@ function computeDecorations(doc) {
                 if (idx >= 0) { paramRanges.push(new vscode.Range(ln, idx, ln, idx + val.length)); searchFrom = idx + val.length; }
             }
         } else {
-            // ── Exactly one match → all good, highlight params ────────────
+            // ── Exactly one compatible match → highlight params ───────────
             const { match: bestMatch } = allMatches[0];
             let searchFrom = stepStart;
             for (let g = 1; g < bestMatch.length; g++) {
@@ -253,9 +278,9 @@ function generateStepSnippet(keyword, stepText) {
     let idx = 0;
 
     const pattern = stepText
-        .replace(/"[^"]*"/g,      () => { params.push({ type: 'string', name: `p${++idx}` }); return '{string}'; })
+        .replace(/"[^"]*"/g,        () => { params.push({ type: 'string', name: `p${++idx}` }); return '{string}'; })
         .replace(/\b-?\d+\.\d+\b/g, () => { params.push({ type: 'double', name: `p${++idx}` }); return '{double}'; })
-        .replace(/\b-?\d+\b/g,   () => { params.push({ type: 'int',    name: `p${++idx}` }); return '{int}'; });
+        .replace(/\b-?\d+\b/g,      () => { params.push({ type: 'int',    name: `p${++idx}` }); return '{int}'; });
 
     const methodName = pattern
         .replace(/\{[^}]+\}/g, '').replace(/[^a-zA-Z0-9 ]/g, ' ').trim()
@@ -394,8 +419,8 @@ async function cmdInsertStepSnippet(snippet) {
         return;
     }
 
-    const indentMatch    = text.match(/^(\s+)\[(?:Given|When|Then)/m);
-    const indent         = indentMatch ? indentMatch[1] : '    ';
+    const indentMatch     = text.match(/^(\s+)\[(?:Given|When|Then)/m);
+    const indent          = indentMatch ? indentMatch[1] : '    ';
     const indentedSnippet = '\n' + snippet.split('\n').map(l => (l.trim() === '' ? '' : indent + l)).join('\n') + '\n';
 
     await editor.edit(eb => eb.insert(doc.positionAt(lastBrace), indentedSnippet));
@@ -417,10 +442,15 @@ const definitionProvider = {
         const lineText = document.lineAt(position.line).text;
         const kw = lineText.match(/^(\s*)(Given|When|Then|And|But)\s+/i);
         if (!kw) return null;
+
         const stepText   = lineText.slice(kw[0].length).trim();
+        const stepKw     = kw[2].toLowerCase();
+        const compatSet  = KW_COMPAT[stepKw] || new Set([stepKw]);
         const candidates = getCandidates(stepText);
+
         let bestDef = null, bestCapLen = Infinity;
         for (const def of candidates) {
+            if (!compatSet.has(def.defKeyword)) continue;   // ← same keyword filter
             const m = stepText.match(def.regex);
             if (!m) continue;
             const capLen = m.slice(1).reduce((sum, g) => sum + (g ? g.length : 0), 0);
