@@ -136,6 +136,41 @@ Scenario Outline: Purchase validation
 
 ---
 
+## 🆕 New Updates (v0.0.4)
+
+### ⚠️ Ambiguous Step Detection
+- Automatically detects when **multiple step definitions match the same step**
+- Highlights ambiguous steps with **orange wavy underline**
+- Prevents hidden conflicts that would otherwise fail at runtime
+
+### 🔎 Navigate to All Matching Definitions
+- Hover on an ambiguous step to see **all matching step definitions**
+- Click directly to jump to:
+  - 📄 File name  
+  - 📍 Exact line number  
+- Helps quickly resolve ambiguity without manual searching
+
+### ⚡ Quick Fix for Missing Steps
+- Press **Ctrl + . (Quick Fix)** on unmatched steps
+- Instantly:
+  - 📋 Copy step definition snippet  
+  - ➕ Insert snippet directly into your Steps file  
+- Speeds up step creation dramatically
+
+### 🔄 Real-Time Updates (No Rebuild Needed)
+- No need to restart or rebuild after adding new steps
+- Automatically detects:
+  - New step files  
+  - Updated step definitions  
+- Updates highlighting and navigation instantly
+
+### 🎨 Updated Color Scheme
+- 🟢 **Parameters (example values)** → Green  
+- 🟠 **Ambiguous steps** → Orange wavy underline  
+- 🟣 **Missing step definitions** → Purple wavy underline  
+- 🔵 **Step keywords** → Blue   
+---
+
 ## 💬 Support
 
 Found a bug or have a feature request? We'd love to hear from you!
