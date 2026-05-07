@@ -403,6 +403,7 @@ const definitionProvider = {
 function activate(context) {
     paramDecoration     = vscode.window.createTextEditorDecorationType({ color: '#CE9178', fontWeight: 'bold' });
     outlineDecoration   = vscode.window.createTextEditorDecorationType({ color: '#FF69B4', fontWeight: 'bold' });
+    outlineDecoration = vscode.window.createTextEditorDecorationType({ color: '#4EC994', fontWeight: 'bold' });
     stepKwDecoration    = vscode.window.createTextEditorDecorationType({ color: '#569CD6', fontWeight: 'bold' });
     featureKwDecoration = vscode.window.createTextEditorDecorationType({ color: '#C586C0', fontWeight: 'bold' });
     unmatchedDecoration = vscode.window.createTextEditorDecorationType({
