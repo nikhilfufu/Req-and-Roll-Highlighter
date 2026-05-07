@@ -17,21 +17,11 @@ const decorCache = new Map();
 const debounceTimers = new Map();
 const DEBOUNCE_MS = 250;
 
-// Unmatched step tracker:   docUri -> [{range, keyword, stepText}]
+// Unmatched step tracker:   docUri -> [{range, keyword, resolvedKeyword, stepText}]
 const unmatchedStepMap = new Map();
 
 // Ambiguous step tracker:   docUri -> [{range, keyword, stepText, matchingDefs[]}]
 const ambiguousStepMap = new Map();
-
-// Step preference configuration - prioritize certain step types for disambiguation
-const STEP_PREFERENCES = {
-    // For actions, prefer When over Then
-    'action': ['when', 'given', 'then'],
-    // For verifications, prefer Then over When
-    'verification': ['then', 'when', 'given'],
-    // Default preference order
-    'default': ['when', 'then', 'given']
-};
 
 // ─── Pattern helpers ──────────────────────────────────────────────────────────
 
@@ -154,6 +144,7 @@ async function loadStepDefinitions() {
 // ─── Keyword compatibility map ────────────────────────────────────────────────
 
 // Strict keyword matching - only exact matches allowed
+// And/But are context-neutral so they match any def keyword
 const KW_COMPAT = {
     given: new Set(['given']),
     when:  new Set(['when']),
@@ -162,34 +153,26 @@ const KW_COMPAT = {
     but:   new Set(['given', 'when', 'then', 'and', 'but']),
 };
 
-// ─── Step preference disambiguation ───────────────────────────────────────────
-
-function applyStepPreferences(allMatches, stepText) {
-    if (allMatches.length <= 1) return allMatches[0] || null;
-
-    let preferenceType = 'default';
-    if (stepText.match(/\b(verify|check|validate|should|assert|confirm|ensure)\b/i)) {
-        preferenceType = 'verification';
-    } else if (stepText.match(/\b(click|enter|select|upload|navigate|login|update|process)\b/i)) {
-        preferenceType = 'action';
+// ─── Resolve "And"/"But" keyword from context ─────────────────────────────────
+// Walks back up the document to find the last Given/When/Then keyword
+// so that snippets generated for And/But steps use the correct C# attribute.
+function resolveKeywordFromContext(doc, lineIndex) {
+    for (let i = lineIndex - 1; i >= 0; i--) {
+        const text = doc.lineAt(i).text;
+        const m = text.match(/^\s*(Given|When|Then)\s+/i);
+        if (m) return m[1].toLowerCase();
+        // Stop searching at scenario/feature boundaries
+        if (/^\s*(Scenario|Feature|Background|Rule)/i.test(text)) break;
     }
-
-    const preferences = STEP_PREFERENCES[preferenceType];
-
-    for (const preferredKeyword of preferences) {
-        const match = allMatches.find(m => m.def.defKeyword === preferredKeyword);
-        if (match) return match;
-    }
-
-    return allMatches[0];
+    return 'given'; // safe fallback
 }
 
 // ─── Decoration computation ───────────────────────────────────────────────────
 
 function computeDecorations(doc) {
-    const paramRanges    = [];
-    const outlineRanges  = [];
-    const stepKwRanges   = [];
+    const paramRanges     = [];
+    const outlineRanges   = [];
+    const stepKwRanges    = [];
     const featureKwRanges = [];
     const unmatchedRanges = [];
     const ambiguousRanges = [];
@@ -225,6 +208,11 @@ function computeDecorations(doc) {
             outlineRanges.push(new vscode.Range(ln, om.index, ln, om.index + om[0].length));
         }
 
+        // ── Resolve effective keyword for And/But (used in snippet generation) ──
+        const resolvedKeyword = (stepKw === 'and' || stepKw === 'but')
+            ? resolveKeywordFromContext(doc, ln)
+            : stepKw;
+
         // ── Collect definitions that match the text AND have a compatible keyword ──
         const candidates = getCandidates(stepText);
         const allMatches = [];
@@ -244,50 +232,35 @@ function computeDecorations(doc) {
             // ── No compatible definition found → purple unmatched ─────────
             if (stepDefsLoaded) {
                 unmatchedRanges.push(range);
-                unmatchedSteps.push({ range, keyword: sk[2], stepText });
+                // FIX: store resolvedKeyword so snippet uses correct attribute
+                unmatchedSteps.push({ range, keyword: sk[2], resolvedKeyword, stepText });
             }
 
         } else if (allMatches.length > 1) {
-            // ── Apply preference-based disambiguation ──────────────────────
-            const preferredMatch = applyStepPreferences(allMatches, stepText);
+            // ── More than one compatible definition matches → orange ambiguous ──
+            // FIX: always flag as ambiguous; never silently pick one
+            ambiguousRanges.push(range);
+            ambiguousSteps.push({
+                range,
+                keyword: sk[2],
+                stepText,
+                matchingDefs: allMatches.map(({ def }) => def),
+            });
 
-            if (preferredMatch) {
-                // Use preferred match instead of marking as ambiguous
-                const { match: bestMatch } = preferredMatch;
-                let searchFrom = stepStart;
-                for (let g = 1; g < bestMatch.length; g++) {
-                    if (!bestMatch[g]) continue;
-                    const val = bestMatch[g];
-                    const idx = lineText.indexOf(val, searchFrom);
-                    if (/^<[^>]+>$/.test(val)) { searchFrom = idx + val.length; continue; }
-                    if (idx >= 0) {
-                        paramRanges.push(new vscode.Range(ln, idx, ln, idx + val.length));
-                        searchFrom = idx + val.length;
-                    }
+            // Still highlight params using best (lowest capLen) match so the
+            // file doesn't look completely broken while the developer resolves it
+            const best = allMatches.reduce((a, b) => a.capLen <= b.capLen ? a : b);
+            let searchFrom = stepStart;
+            for (let g = 1; g < best.match.length; g++) {
+                if (!best.match[g]) continue;
+                const val = best.match[g];
+                const idx = lineText.indexOf(val, searchFrom);
+                if (/^<[^>]+>$/.test(val)) { searchFrom = idx + val.length; continue; }
+                if (idx >= 0) {
+                    paramRanges.push(new vscode.Range(ln, idx, ln, idx + val.length));
+                    searchFrom = idx + val.length;
                 }
-            } else {
-                // ── More than one compatible definition matches → orange ambiguous ──
-                ambiguousRanges.push(range);
-                ambiguousSteps.push({
-                    range,
-                    keyword: sk[2],
-                    stepText,
-                    matchingDefs: allMatches.map(({ def }) => def),
-                });
-                // Still highlight params using best (lowest capLen) match
-                const best = allMatches.reduce((a, b) => a.capLen <= b.capLen ? a : b);
-                let searchFrom = stepStart;
-                for (let g = 1; g < best.match.length; g++) {
-                    if (!best.match[g]) continue;
-                    const val = best.match[g];
-                    const idx = lineText.indexOf(val, searchFrom);
-                    if (/^<[^>]+>$/.test(val)) { searchFrom = idx + val.length; continue; }
-                    if (idx >= 0) {
-                        paramRanges.push(new vscode.Range(ln, idx, ln, idx + val.length));
-                        searchFrom = idx + val.length;
-                    }
-                }
-            }   // ← closes inner else (ambiguous)
+            }
 
         } else {
             // ── Exactly one compatible match → highlight params ───────────
@@ -352,16 +325,16 @@ function scheduleDecorate(editor) {
 
 // ─── Snippet generator ────────────────────────────────────────────────────────
 
-function generateStepSnippet(keyword, stepText) {
-    const kwMap = { given: 'Given', when: 'When', then: 'Then', and: 'Given', but: 'Given' };
-    const attr  = kwMap[keyword.toLowerCase()] || 'Given';
+// FIX: uses resolvedKeyword directly — no more kwMap that clobbers And/But to Given
+function generateStepSnippet(resolvedKeyword, stepText) {
+    const attr = resolvedKeyword.charAt(0).toUpperCase() + resolvedKeyword.slice(1);
     const params = [];
     let idx = 0;
 
     const pattern = stepText
-        .replace(/"[^"]*"/g,         () => { params.push({ type: 'string', name: `p${++idx}` }); return '{string}'; })
-        .replace(/\b-?\d+\.\d+\b/g,  () => { params.push({ type: 'double', name: `p${++idx}` }); return '{double}'; })
-        .replace(/\b-?\d+\b/g,       () => { params.push({ type: 'int',    name: `p${++idx}` }); return '{int}'; });
+        .replace(/"[^"]*"/g,          () => { params.push({ type: 'string', name: `p${++idx}` }); return '{string}'; })
+        .replace(/\b-?\d+\.\d+\b/g,   () => { params.push({ type: 'double', name: `p${++idx}` }); return '{double}'; })
+        .replace(/\b-?\d+\b/g,        () => { params.push({ type: 'int',    name: `p${++idx}` }); return '{int}'; });
 
     const methodName = pattern
         .replace(/\{[^}]+\}/g, '').replace(/[^a-zA-Z0-9 ]/g, ' ').trim()
@@ -412,7 +385,9 @@ const snippetCodeActionProvider = {
         // ── Unmatched steps: offer snippet generation ──────────────────────
         for (const entry of (unmatchedStepMap.get(key) || [])) {
             if (!entry.range.intersection(range)) continue;
-            const snippet = generateStepSnippet(entry.keyword, entry.stepText);
+
+            // FIX: pass resolvedKeyword so And/But steps get [When(...)]/[Then(...)] etc.
+            const snippet = generateStepSnippet(entry.resolvedKeyword, entry.stepText);
 
             const copyAction = new vscode.CodeAction(
                 `$(clippy) Copy step definition snippet`,
