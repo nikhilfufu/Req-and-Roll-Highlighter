@@ -38,6 +38,16 @@
         "command": "bdd.insertStepSnippet",
         "title": "BDD: Insert Step Definition into Steps File",
         "category": "BDD"
+      },
+      {
+        "command": "bdd.showAmbiguousMatches",
+        "title": "BDD: Show Ambiguous Step Matches",
+        "category": "BDD"
+      },
+      {
+        "command": "bdd.goToDefinitionLine",
+        "title": "BDD: Go To Step Definition Line",
+        "category": "BDD"
       }
     ]
   }

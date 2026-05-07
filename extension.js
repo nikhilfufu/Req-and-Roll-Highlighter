@@ -143,8 +143,6 @@ async function loadStepDefinitions() {
 
 // ─── Keyword compatibility map ────────────────────────────────────────────────
 
-// Strict keyword matching - only exact matches allowed
-// And/But are context-neutral so they match any def keyword
 const KW_COMPAT = {
     given: new Set(['given']),
     when:  new Set(['when']),
@@ -154,17 +152,14 @@ const KW_COMPAT = {
 };
 
 // ─── Resolve "And"/"But" keyword from context ─────────────────────────────────
-// Walks back up the document to find the last Given/When/Then keyword
-// so that snippets generated for And/But steps use the correct C# attribute.
 function resolveKeywordFromContext(doc, lineIndex) {
     for (let i = lineIndex - 1; i >= 0; i--) {
         const text = doc.lineAt(i).text;
         const m = text.match(/^\s*(Given|When|Then)\s+/i);
         if (m) return m[1].toLowerCase();
-        // Stop searching at scenario/feature boundaries
         if (/^\s*(Scenario|Feature|Background|Rule)/i.test(text)) break;
     }
-    return 'given'; // safe fallback
+    return 'given';
 }
 
 // ─── Decoration computation ───────────────────────────────────────────────────
@@ -208,12 +203,10 @@ function computeDecorations(doc) {
             outlineRanges.push(new vscode.Range(ln, om.index, ln, om.index + om[0].length));
         }
 
-        // ── Resolve effective keyword for And/But (used in snippet generation) ──
         const resolvedKeyword = (stepKw === 'and' || stepKw === 'but')
             ? resolveKeywordFromContext(doc, ln)
             : stepKw;
 
-        // ── Collect definitions that match the text AND have a compatible keyword ──
         const candidates = getCandidates(stepText);
         const allMatches = [];
 
@@ -229,16 +222,12 @@ function computeDecorations(doc) {
         const range  = new vscode.Range(ln, stepStart, ln, endCol);
 
         if (allMatches.length === 0) {
-            // ── No compatible definition found → purple unmatched ─────────
             if (stepDefsLoaded) {
                 unmatchedRanges.push(range);
-                // FIX: store resolvedKeyword so snippet uses correct attribute
                 unmatchedSteps.push({ range, keyword: sk[2], resolvedKeyword, stepText });
             }
 
         } else if (allMatches.length > 1) {
-            // ── More than one compatible definition matches → orange ambiguous ──
-            // FIX: always flag as ambiguous; never silently pick one
             ambiguousRanges.push(range);
             ambiguousSteps.push({
                 range,
@@ -247,8 +236,6 @@ function computeDecorations(doc) {
                 matchingDefs: allMatches.map(({ def }) => def),
             });
 
-            // Still highlight params using best (lowest capLen) match so the
-            // file doesn't look completely broken while the developer resolves it
             const best = allMatches.reduce((a, b) => a.capLen <= b.capLen ? a : b);
             let searchFrom = stepStart;
             for (let g = 1; g < best.match.length; g++) {
@@ -263,7 +250,6 @@ function computeDecorations(doc) {
             }
 
         } else {
-            // ── Exactly one compatible match → highlight params ───────────
             const { match: bestMatch } = allMatches[0];
             let searchFrom = stepStart;
             for (let g = 1; g < bestMatch.length; g++) {
@@ -323,9 +309,67 @@ function scheduleDecorate(editor) {
     }, DEBOUNCE_MS));
 }
 
+// ─── Hover provider ───────────────────────────────────────────────────────────
+
+const hoverProvider = {
+    provideHover(document, position) {
+        if (!document.fileName.endsWith('.feature')) return null;
+        const key = document.uri.toString();
+
+        // ── Check ambiguous steps first ───────────────────────────────────
+        for (const entry of (ambiguousStepMap.get(key) || [])) {
+            if (!entry.range.contains(position)) continue;
+
+            const md = new vscode.MarkdownString('', true);
+            md.isTrusted = true; // allow command links
+            md.supportHtml = true;
+
+            md.appendMarkdown(`### ⚠️ Ambiguous Step\n`);
+            md.appendMarkdown(`**"${entry.stepText}"** matches **${entry.matchingDefs.length}** definitions:\n\n`);
+            md.appendMarkdown(`---\n`);
+
+            entry.matchingDefs.forEach((def, i) => {
+                const relPath  = vscode.workspace.asRelativePath(def.file);
+                const fileName = relPath.split(/[\\/]/).pop();
+                const lineNum  = def.line + 1;
+
+                // Clickable link that jumps to the definition
+                const args     = encodeURIComponent(JSON.stringify([def.file.toString(), def.line]));
+                const cmdUri   = `command:bdd.goToDefinitionLine?${args}`;
+
+                md.appendMarkdown(`**${i + 1}.** \`[${def.defKeyword.charAt(0).toUpperCase() + def.defKeyword.slice(1)}]\`  \n`);
+                md.appendMarkdown(`&nbsp;&nbsp;&nbsp;&nbsp;📄 [${fileName} — Line ${lineNum}](${cmdUri})  \n`);
+                md.appendMarkdown(`&nbsp;&nbsp;&nbsp;&nbsp;📁 \`${relPath}\`  \n`);
+                md.appendMarkdown(`&nbsp;&nbsp;&nbsp;&nbsp;🔍 Pattern: \`${def.rawPattern}\`\n\n`);
+            });
+
+            md.appendMarkdown(`---\n`);
+            md.appendMarkdown(`*Reqnroll will throw \`AmbiguousStepDefinitionException\` at runtime.*`);
+
+            return new vscode.Hover(md, entry.range);
+        }
+
+        // ── Check unmatched steps ─────────────────────────────────────────
+        for (const entry of (unmatchedStepMap.get(key) || [])) {
+            if (!entry.range.contains(position)) continue;
+
+            const md = new vscode.MarkdownString('', true);
+            md.isTrusted = true;
+
+            md.appendMarkdown(`### ❌ No Matching Step Definition\n`);
+            md.appendMarkdown(`**"${entry.stepText}"** has no matching \`[${entry.resolvedKeyword.charAt(0).toUpperCase() + entry.resolvedKeyword.slice(1)}(...)]\` definition.\n\n`);
+            md.appendMarkdown(`---\n`);
+            md.appendMarkdown(`💡 Use **Quick Fix** (\`Ctrl+.\`) to generate and copy a snippet.`);
+
+            return new vscode.Hover(md, entry.range);
+        }
+
+        return null;
+    }
+};
+
 // ─── Snippet generator ────────────────────────────────────────────────────────
 
-// FIX: uses resolvedKeyword directly — no more kwMap that clobbers And/But to Given
 function generateStepSnippet(resolvedKeyword, stepText) {
     const attr = resolvedKeyword.charAt(0).toUpperCase() + resolvedKeyword.slice(1);
     const params = [];
@@ -386,7 +430,6 @@ const snippetCodeActionProvider = {
         for (const entry of (unmatchedStepMap.get(key) || [])) {
             if (!entry.range.intersection(range)) continue;
 
-            // FIX: pass resolvedKeyword so And/But steps get [When(...)]/[Then(...)] etc.
             const snippet = generateStepSnippet(entry.resolvedKeyword, entry.stepText);
 
             const copyAction = new vscode.CodeAction(
@@ -417,6 +460,17 @@ const snippetCodeActionProvider = {
         return actions;
     }
 };
+
+// ─── Command: go to definition by file + line ─────────────────────────────────
+
+async function cmdGoToDefinitionLine(fileUri, line) {
+    const uri = typeof fileUri === 'string' ? vscode.Uri.parse(fileUri) : fileUri;
+    const doc    = await vscode.workspace.openTextDocument(uri);
+    const editor = await vscode.window.showTextDocument(doc);
+    const pos    = new vscode.Position(line, 0);
+    editor.selection = new vscode.Selection(pos, pos);
+    editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
+}
 
 // ─── Command: navigate ambiguous matches ──────────────────────────────────────
 
@@ -526,14 +580,12 @@ function activate(context) {
     stepKwDecoration    = vscode.window.createTextEditorDecorationType({ color: '#569CD6', fontWeight: 'bold' });
     featureKwDecoration = vscode.window.createTextEditorDecorationType({ color: '#C586C0', fontWeight: 'bold' });
 
-    // Purple wavy underline = no matching definition
     unmatchedDecoration = vscode.window.createTextEditorDecorationType({
         color: '#C586C0',
         fontWeight: 'bold',
         textDecoration: 'underline wavy #C586C0',
     });
 
-    // Orange wavy underline = multiple definitions match (ambiguous)
     ambiguousDecoration = vscode.window.createTextEditorDecorationType({
         color: '#FF8C00',
         fontWeight: 'bold',
@@ -564,6 +616,11 @@ function activate(context) {
         paramDecoration, outlineDecoration, stepKwDecoration,
         featureKwDecoration, unmatchedDecoration, ambiguousDecoration,
 
+        // ── Hover provider (ambiguous + unmatched tooltips) ────────────────
+        vscode.languages.registerHoverProvider({ language: 'feature' }, hoverProvider),
+        vscode.languages.registerHoverProvider({ language: 'gherkin' }, hoverProvider),
+        vscode.languages.registerHoverProvider({ scheme: 'file', pattern: '**/*.feature' }, hoverProvider),
+
         vscode.languages.registerDefinitionProvider({ language: 'feature' }, definitionProvider),
         vscode.languages.registerDefinitionProvider({ language: 'gherkin' }, definitionProvider),
         vscode.languages.registerDefinitionProvider({ scheme: 'file', pattern: '**/*.feature' }, definitionProvider),
@@ -572,9 +629,10 @@ function activate(context) {
             providedCodeActionKinds: [SNIPPET_ACTION_KIND],
         }),
 
-        vscode.commands.registerCommand('bdd.copyStepSnippet',      cmdCopyStepSnippet),
-        vscode.commands.registerCommand('bdd.insertStepSnippet',    cmdInsertStepSnippet),
-        vscode.commands.registerCommand('bdd.showAmbiguousMatches', cmdShowAmbiguousMatches),
+        vscode.commands.registerCommand('bdd.copyStepSnippet',        cmdCopyStepSnippet),
+        vscode.commands.registerCommand('bdd.insertStepSnippet',      cmdInsertStepSnippet),
+        vscode.commands.registerCommand('bdd.showAmbiguousMatches',   cmdShowAmbiguousMatches),
+        vscode.commands.registerCommand('bdd.goToDefinitionLine',     cmdGoToDefinitionLine),
 
         vscode.window.onDidChangeActiveTextEditor(decorateEditor),
         vscode.workspace.onDidChangeTextDocument(evt => {
