@@ -1,5 +1,5 @@
 {
-  "name": "req-n-roll-highlighter",
+  "name": "req-and-roll-highlighter",
   "displayName": "ReqnRoll Highlighter",
   "description": "Req and Roll Highlighter - Advanced syntax highlighting and step navigation for Reqnroll/SpecFlow Gherkin features. Smart parameter highlighting, Go-to-Definition, and Cucumber Expression support for C# test automation.",
   "version": "0.0.4",
