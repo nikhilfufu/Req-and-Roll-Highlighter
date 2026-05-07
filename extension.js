@@ -406,9 +406,9 @@ function activate(context) {
     stepKwDecoration    = vscode.window.createTextEditorDecorationType({ color: '#569CD6', fontWeight: 'bold' });
     featureKwDecoration = vscode.window.createTextEditorDecorationType({ color: '#C586C0', fontWeight: 'bold' });
     unmatchedDecoration = vscode.window.createTextEditorDecorationType({
-        color: '#F44747',
-        fontWeight: 'bold',
-        textDecoration: 'underline wavy #F44747',
+    color: '#C586C0',
+    fontWeight: 'bold',
+    textDecoration: 'underline wavy #C586C0',
     });
 
     statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
